@@ -14,6 +14,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.UUID;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import org.hamcrest.Description;
@@ -28,6 +29,8 @@ import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
+import com.amazonaws.ClientConfiguration;
+import com.amazonaws.auth.AWSCredentials;
 import com.amazonaws.regions.RegionUtils;
 import com.amazonaws.services.s3.AmazonS3Client;
 import com.amazonaws.services.s3.model.ObjectMetadata;
@@ -59,15 +62,9 @@ import com.amazonaws.services.s3.model.S3ObjectInputStream;
 public class EndToEndTest {
     private static final Logger LOG = Logger.getLogger("EndToEndTest");
     
-    private AmazonS3Client s3Client;
     private String region;
     private String bucketName;
     private String objectId;
-
-    @Before
-    public void setupS3Client() {
-        this.s3Client = new AmazonS3Client();
-    }
     
     @Before
     public void determineRegion() {
@@ -88,49 +85,53 @@ public class EndToEndTest {
     
     @After
     public void cleanupTestData() {
-        if (this.s3Client != null) {
-            LOG.info("Deleting file " + this.objectId + " from " + this.bucketName);
-            this.s3Client.deleteObject(this.bucketName, this.objectId);
-            LOG.info("File " + this.objectId + " deleted from " + this.bucketName);
-        }
+        AmazonS3Client s3Client = new AmazonS3Client();
+        s3Client.setRegion(RegionUtils.getRegion(this.region));
+
+        LOG.info("Deleting file " + this.objectId + " from " + this.bucketName);
+        s3Client.deleteObject(this.bucketName, this.objectId);
+        LOG.info("File " + this.objectId + " deleted from " + this.bucketName);
     }
     
     @Test
     public void test() throws IOException {
-        this.s3Client.setRegion(RegionUtils.getRegion(this.region));
-
-        verifyS3BucketExists();
+        AmazonS3Client s3Client = new AmazonS3Client(new ClientConfiguration().withSocketTimeout(10000));
+        s3Client.setRegion(RegionUtils.getRegion(this.region));
+        verifyS3BucketExists(s3Client);
         
         byte[] data = createRandomData();
 
         this.objectId = UUID.randomUUID().toString();
 
-        uploadDataToS3(data);
+        uploadDataToS3(data, s3Client);
         
+        s3Client = new AmazonS3Client(new ClientConfiguration().withSocketTimeout(1000));
+        s3Client.setRegion(RegionUtils.getRegion(this.region));
         S3Object object = s3Client.getObject(this.bucketName, this.objectId);
+        
         try(S3ObjectInputStream dataStream = object.getObjectContent()) {
-            BufferedInputStream bufferedStream = new BufferedInputStream(dataStream, 1024 * 1024);
-            for (int i = 0; i < 8; i++) {
-                int bytesToRead = 512 * 1024;
+            int bytesToRead = 512 * 1024;
+            for (int i = 0; i < 4; i++) {
                 byte[] bufferedData = new byte[bytesToRead];
                 
                 LOG.info("Reading block " + i + " of object " + this.objectId + " from " + this.bucketName);
                 
                 int bytesRead = 0;
                 while (bytesRead < bytesToRead) {
-                    bytesRead += bufferedStream.read(bufferedData, bytesRead, bytesToRead - bytesRead);
+                    bytesRead += dataStream.read(bufferedData, bytesRead, bytesToRead - bytesRead);
                 }
                 
                 LOG.info("Read block " + i + " of object " + this.objectId + " from " + this.bucketName);
                 
                 byte[] targetData = Arrays.copyOfRange(data, i * bytesToRead, (i + 1) * bytesToRead);
                 Assert.assertArrayEquals("Data is not equal for block " + i, targetData, bufferedData);
+                
+                dataStream.getHttpRequest().abort(); // simulate the timeout; it turns out to be hard to reproduce it.
             }
         }
     }
 
-
-    private void uploadDataToS3(byte[] data) {
+    private void uploadDataToS3(byte[] data, AmazonS3Client s3Client) {
         LOG.info("Uploading file " + this.objectId + " to bucket" + this.bucketName);
         ObjectMetadata metadata = new ObjectMetadata();
         metadata.setContentEncoding("application/octet-stream");
@@ -142,14 +143,14 @@ public class EndToEndTest {
     }
 
     private byte[] createRandomData() {
-        byte[] data = new byte[4 * 1024 * 1024];
+        byte[] data = new byte[2 * 1024 * 1024];
         new Random().nextBytes(data);
         return data;
     }
 
-    private void verifyS3BucketExists() {
+    private void verifyS3BucketExists(AmazonS3Client s3Client) {
         LOG.info("Verifying that bucket " + this.bucketName + " exists");
-        Assume.assumeTrue("The S3 bucket must exist", this.s3Client.doesBucketExist(this.bucketName));
+        Assume.assumeTrue("The S3 bucket must exist", s3Client.doesBucketExist(this.bucketName));
         LOG.info("Bucket " + this.bucketName + " does exist");
     }
 
